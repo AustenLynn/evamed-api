@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-DUMP_FILE="/docker-entrypoint-initdb.d/backup.dump"
+DUMP_FILE="/docker-entrypoint-initdb.d/backup2025.dump"
 
 if [ -f "$DUMP_FILE" ]; then
   echo "Restoring database from $DUMP_FILE"
