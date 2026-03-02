@@ -583,6 +583,59 @@ class ConstructiveSystemElementSerializer(serializers.ModelSerializer):
         """Handle updating a material"""
         return super().update(instance, validated_data)
 
+
+class MaterialStageSystemSelectionSerializer(serializers.ModelSerializer):
+    """Serializer for materials-stage checkbox options"""
+    label = serializers.CharField(source='construction_system', read_only=True)
+
+    class Meta:
+        model = models.MaterialStageSystemSelection
+        fields = (
+            'id',
+            'project_id',
+            'section_id',
+            'origin_id',
+            'construction_system',
+            'label',
+            'is_selected'
+        )
+
+
+class MaterialStageSelectionUpsertItemSerializer(serializers.Serializer):
+    """Item serializer for materials-stage upsert"""
+    section_id = serializers.IntegerField()
+    origin_id = serializers.IntegerField(required=False, allow_null=True)
+    label = serializers.CharField(max_length=255)
+    is_selected = serializers.BooleanField(required=False)
+
+
+class MaterialStageSelectionUpsertSerializer(serializers.Serializer):
+    """Payload serializer for materials-stage options upsert"""
+    project_id = serializers.IntegerField()
+    items = MaterialStageSelectionUpsertItemSerializer(many=True)
+
+
+class MaterialStageSelectionUpdateItemSerializer(serializers.Serializer):
+    """Item serializer for materials-stage state updates"""
+    sistemaConstructivoId = serializers.IntegerField()
+    is_selected = serializers.BooleanField()
+
+
+class MaterialStageSelectionUpdateSerializer(serializers.Serializer):
+    """Payload serializer for materials-stage checkbox updates"""
+    project_id = serializers.IntegerField()
+    items = MaterialStageSelectionUpdateItemSerializer(many=True, required=False, default=[])
+    selectedIds = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=[]
+    )
+    unselectedIds = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=[]
+    )
+
 class SourcesElectricityConsumptionSerializer(serializers.ModelSerializer):
     """Serializes a create SEC"""
     class Meta:

@@ -274,6 +274,27 @@ class MaterialSchemeData(models.Model):
         """Return string representation of material"""
         return self.value
 
+
+class MaterialStageSystemSelection(models.Model):
+    """Persist materials-stage checkbox state per system option"""
+    project_id = models.ForeignKey(Project, on_delete=models.CASCADE)
+    section_id = models.ForeignKey(Section, on_delete=models.CASCADE)
+    origin_id = models.ForeignKey(Origin, on_delete=models.CASCADE, null=True)
+    construction_system = models.CharField(max_length=255)
+    is_selected = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project_id', 'section_id', 'origin_id', 'construction_system'],
+                name='uniq_material_stage_system_selection'
+            )
+        ]
+
+    def __str__(self):
+        """Return string representation of selection"""
+        return f"{self.project_id_id}-{self.section_id_id}-{self.construction_system}"
+
 class ConstructiveSystemElement(models.Model):
     """CSE model"""
     project_id = models.ForeignKey(Project, on_delete=models.CASCADE, null=True)

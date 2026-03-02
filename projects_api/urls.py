@@ -46,5 +46,7 @@ router.register('conversions', views.ConversionsViewSet)
 router.register('database-material', views.DataBaseMaterialViewSet)
 
 urlpatterns = [
+    path('materials-stage/', views.MaterialStageView.as_view()),
+    path('materials-stage/update/', views.MaterialStageUpdateView.as_view()),
     path('', include(router.urls))
 ]
