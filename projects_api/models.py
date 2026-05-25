@@ -5,7 +5,7 @@ from django.contrib.auth.models import User
 class UserPlatform(models.Model):
     """UserPlatform model"""
     name = models.CharField(max_length=255, null=True)
-    email = models.CharField(max_length=255, null=True)
+    email = models.CharField(max_length=255, null=True, db_index=True)
     institution = models.CharField(max_length=255, null=True)
     sector = models.CharField(max_length=255, null=True)
     country = models.CharField(max_length=255, null=True)
