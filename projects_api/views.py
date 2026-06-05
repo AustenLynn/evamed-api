@@ -51,7 +51,7 @@ class CountriesViewSet(viewsets.ModelViewSet):
 class ExternalDistanceViewSet(viewsets.ModelViewSet):
     """Handle creating and updating countries"""
     serializer_class = serializers.ExternalDistanceSerializer
-    queryset = models.ExternalDistance.objects.all()
+    queryset = models.ExternalDistance.objects.select_related('country_id_origin')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
@@ -72,14 +72,17 @@ class HousingSchemeViewSet(viewsets.ModelViewSet):
 class ProjectsViewSet(viewsets.ModelViewSet):
     """Handle creating and updating profiles"""
     serializer_class = serializers.ProjectsSerializer
-    queryset = models.Project.objects.all()
+    queryset = models.Project.objects.select_related(
+        'use_id', 'type_id', 'country_id', 'useful_life_id',
+        'housing_scheme_id', 'user_platform_id', 'city_id_origin',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id',)
 
 class MaterialsViewSet(viewsets.ModelViewSet):
     """Handle creating and updating materials"""
     serializer_class = serializers.MaterialsSerializer
-    queryset = models.Material.objects.all()
+    queryset = models.Material.objects.select_related('unit_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ['=id', 'name_material']
 
@@ -156,30 +159,257 @@ class ConstructiveProcessViewSet(viewsets.ModelViewSet):
 class MaterialSchemeProjectViewSet(viewsets.ModelViewSet):
     """Handle creating and updating material scheme project"""
     serializer_class = serializers.MaterialSchemeProjectSerializer
-    queryset = models.MaterialSchemeProject.objects.all()
+    queryset = models.MaterialSchemeProject.objects.select_related(
+        'material_id', 'project_id', 'origin_id', 'section_id',
+        'city_id_origin', 'state_id_origin', 'city_id_end',
+        'transport_id_origin', 'transport_id_end',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=material_id', )
 
 class MaterialSchemeProjectOriginalViewSet(viewsets.ModelViewSet):
     """Handle creating and updating material scheme project"""
     serializer_class = serializers.MaterialSchemeProjectOriginalSerializer
-    queryset = models.MaterialSchemeProjectOrigianal.objects.all()
+    queryset = models.MaterialSchemeProjectOrigianal.objects.select_related(
+        'material_id', 'project_id', 'origin_id', 'section_id',
+        'city_id_origin', 'city_id_end', 'transport_id_origin', 'transport_id_end',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=material_id', )
 
 class MaterialSchemeDataViewSet(viewsets.ModelViewSet):
     """Handle creating and updating material scheme data"""
     serializer_class = serializers.MaterialSchemeDataSerializer
-    queryset = models.MaterialSchemeData.objects.all()
+    queryset = models.MaterialSchemeData.objects.select_related(
+        'material_id', 'standard_id', 'potential_type_id', 'unit_id',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('value', )
 
 class ConstructiveSystemElementViewSet(viewsets.ModelViewSet):
     """Handle creating and updating CSE"""
     serializer_class = serializers.ConstructiveSystemElementSerializer
-    queryset = models.ConstructiveSystemElement.objects.all()
+    queryset = models.ConstructiveSystemElement.objects.select_related(
+        'project_id', 'section_id', 'constructive_process_id',
+        'volume_unit_id', 'energy_unit_id', 'bulk_unit_id', 'source_information_id',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=project_id', )
+
+
+_IMPACTOS_IGNORAR = frozenset([
+    'PARNR', 'POT', 'Human toxicity',
+    'Fresh water aquatic ecotox.', 'Marine aquatic ecotoxicity',
+    'Terrestrial ecotoxicity',
+])
+
+_PRODUCTION_STAGES = [2, 3, 4]  # standard_id: A1, A2, A3
+
+
+class ProjectResultsView(APIView):
+    """
+    Python port of the frontend OperacionesDeFase computation.
+    Returns pre-computed lifecycle impact results for a project so the
+    browser does not have to download ~12 full datasets and run the
+    calculation in JavaScript.
+
+    GET /api-projects/projects/<id>/results/
+    Optional query param:  ?databases=EPiC,EPD   (comma-separated; omit = all)
+    """
+
+    def get(self, request, project_id):
+        databases_param = request.query_params.get('databases', None)
+
+        try:
+            project = models.Project.objects.select_related('useful_life_id').get(id=project_id)
+        except models.Project.DoesNotExist:
+            return Response({'detail': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # --- active databases ---
+        all_db_names = set(models.DataBaseMaterial.objects.values_list('name', flat=True))
+        if databases_param:
+            active_databases = set(databases_param.split(',')) & all_db_names
+        else:
+            active_databases = all_db_names
+
+        # --- project-scoped data ---
+        scheme_project = list(
+            models.MaterialSchemeProject.objects.filter(project_id=project_id)
+            .select_related('material_id')
+        )
+        material_ids = [ps.material_id_id for ps in scheme_project]
+
+        # MaterialSchemeData: (material_id, standard_id, potential_type_id) → summed value
+        msd_lookup = {}
+        for msd in models.MaterialSchemeData.objects.filter(material_id__in=material_ids):
+            key = (msd.material_id_id, msd.standard_id_id, msd.potential_type_id_id)
+            msd_lookup[key] = msd_lookup.get(key, 0) + float(msd.value or 0)
+
+        # Conversions: material_id → weight factor
+        conv_lookup = {
+            c.material_id_id: float(c.value or 0)
+            for c in models.Conversions.objects.filter(material_id__in=material_ids)
+        }
+
+        cse_list = list(models.ConstructiveSystemElement.objects.filter(project_id=project_id))
+        ecdp_list = list(
+            models.ElectricityConsumptionDeconstructiveProcess.objects.filter(project_id=project_id)
+        )
+
+        # SourceInformationData filtered to sources used by CSE + ECDP
+        source_ids = list({
+            cse.source_information_id_id for cse in cse_list if cse.source_information_id_id
+        } | {
+            ecdp.source_information_id_id for ecdp in ecdp_list if ecdp.source_information_id_id
+        })
+        sid_lookup = {}
+        if source_ids:
+            for sid in models.SourceInformationData.objects.filter(sourceInformarion_id__in=source_ids):
+                sid_lookup[(sid.sourceInformarion_id_id, sid.potential_type_id_id)] = float(sid.value or 0)
+
+        acr_list = list(models.AnnualConsumptionRequired.objects.filter(project_id=project_id))
+        ecd_list = list(
+            models.ElectricityConsumptionData.objects.filter(
+                annual_consumption_required_id=acr_list[0].id
+            )
+        ) if acr_list else []
+
+        # TypeEnergyData: (type_energy_id, potential_type_id) → value
+        ecd_type_ids = [ecd.type_id for ecd in ecd_list if ecd.type_id]
+        ted_lookup = {}
+        if ecd_type_ids:
+            for ted in models.TypeEnergyData.objects.filter(type_energy_id__in=ecd_type_ids):
+                ted_lookup[(ted.type_energy_id_id, ted.potential_type_id_id)] = float(ted.value or 0)
+
+        # PotentialTransport: (potential_type_id, transport_id) → value
+        pt_lookup = {
+            (pt.potential_type_id_id, pt.transport_id_id): float(pt.value or 0)
+            for pt in models.PotentialTransport.objects.all()
+        }
+
+        # Standards: id → name
+        standards = {s.id: s.name_standard for s in models.Standard.objects.all()}
+
+        # Useful life
+        useful_life = 1.0
+        if project.useful_life_id:
+            try:
+                useful_life = float(project.useful_life_id.name_useful_life)
+            except (ValueError, TypeError):
+                pass
+
+        potential_types = [
+            pt for pt in models.PotentialType.objects.all()
+            if pt.name_potential_type not in _IMPACTOS_IGNORAR
+        ]
+
+        datos = {}
+        error_calculos = False
+
+        for impacto in potential_types:
+            name = impacto.name_complete_potential_type
+            datos[name] = {}
+
+            # ---- Producción ----
+            produccion = {}
+            suma_transport = {}  # material_id → transport contribution (reused in B4)
+
+            for subetapa in _PRODUCTION_STAGES:
+                subproceso = standards.get(subetapa, str(subetapa))
+                total = 0
+                for ps in scheme_project:
+                    mat = ps.material_id
+                    db = mat.database_from or ''
+                    if db not in active_databases or db == 'EPiC':
+                        continue
+                    total += msd_lookup.get((mat.id, subetapa, impacto.id), 0) * float(ps.quantity or 0)
+                produccion[subproceso] = produccion.get(subproceso, 0) + total
+
+            epic_key = standards.get(1, 'EPiC')
+            epic_total = 0
+            for ps in scheme_project:
+                mat = ps.material_id
+                if (mat.database_from or '') not in active_databases:
+                    continue
+                if mat.database_from == 'EPiC':
+                    epic_total += msd_lookup.get((mat.id, 1, impacto.id), 0) * float(ps.quantity or 0)
+            if epic_total:
+                produccion[epic_key] = produccion.get(epic_key, 0) + epic_total
+
+            datos[name]['Producción'] = produccion
+
+            # ---- Construcción ----
+            transport_seen = set()
+            a4_total = 0
+            for ps in scheme_project:
+                mat = ps.material_id
+                db = mat.database_from or ''
+                if db not in active_databases:
+                    continue
+
+                intl = (
+                    pt_lookup.get((impacto.id, ps.transport_id_origin_id or 1), 0)
+                    * float(ps.distance_init)
+                ) if ps.distance_init is not None else 0
+
+                natl = (
+                    pt_lookup.get((impacto.id, ps.transport_id_end_id or 4), 0)
+                    * float(ps.distance_end)
+                ) if ps.distance_end is not None else 0
+
+                peso = conv_lookup.get(mat.id, 1)
+                tv = peso * float(ps.quantity or 0) * (intl + natl)
+                a4_total += tv
+
+                if mat.id not in transport_seen:
+                    suma_transport[mat.id] = 0
+                    transport_seen.add(mat.id)
+                suma_transport[mat.id] += tv
+
+            a5_total = sum(
+                sid_lookup.get((cse.source_information_id_id, impacto.id), 0) * float(cse.quantity or 0)
+                for cse in cse_list
+            )
+            datos[name]['Construccion'] = {'A4': a4_total, 'A5': a5_total}
+
+            # ---- Uso ----
+            b4_total = 0
+            for ps in scheme_project:
+                mat = ps.material_id
+                db = mat.database_from or ''
+                if db not in active_databases:
+                    continue
+                replaces = ps.replaces or 0
+                b4_total += suma_transport.get(mat.id, 0) * replaces
+                if db != 'EPiC':
+                    for subetapa in _PRODUCTION_STAGES:
+                        b4_total += (
+                            msd_lookup.get((mat.id, subetapa, impacto.id), 0)
+                            * float(ps.quantity or 0) * replaces
+                        )
+                else:
+                    b4_total += (
+                        msd_lookup.get((mat.id, 1, impacto.id), 0)
+                        * float(ps.quantity or 0) * replaces
+                    )
+
+            b6_total = sum(
+                useful_life * ted_lookup.get((ecd.type_id, impacto.id), 0) * float(ecd.quantity or 0)
+                for ecd in ecd_list
+            )
+            datos[name]['Uso'] = {'B4': b4_total, 'B6': b6_total}
+
+            # ---- Fin de vida ----
+            c1_total = 0
+            for ecdp in ecdp_list:
+                ev = sid_lookup.get((ecdp.source_information_id_id, impacto.id))
+                if ev is not None:
+                    c1_total += float(ecdp.quantity or 0) * ev
+                else:
+                    error_calculos = True
+            datos[name]['FinDeVida'] = {'C1': c1_total, 'C2': 0, 'C3': 0, 'C4': 0}
+
+        return Response({'project_id': project_id, 'datos': datos, 'error': error_calculos})
 
 
 class MaterialStageView(APIView):
@@ -327,21 +557,23 @@ class SourcesElectricityConsumptionViewSet(viewsets.ModelViewSet):
 class AnnualConsumptionRequiredViewSet(viewsets.ModelViewSet):
     """Handle creating and updating create ACR"""
     serializer_class = serializers.AnnualConsumptionRequiredSerializer
-    queryset = models.AnnualConsumptionRequired.objects.all()
+    queryset = models.AnnualConsumptionRequired.objects.select_related('project_id', 'unit_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=project_id', )
 
 class ElectricityConsumptionDataViewSet(viewsets.ModelViewSet):
     """Handle creating and updating create ECD"""
     serializer_class = serializers.ElectricityConsumptionDataSerializer
-    queryset = models.ElectricityConsumptionData.objects.all()
+    queryset = models.ElectricityConsumptionData.objects.select_related(
+        'annual_consumption_required_id', 'unit_id', 'type',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=annual_consumption_required_id', )
 
 class StageSchemeDataViewSet(viewsets.ModelViewSet):
     """Handle creating and updating create SSD"""
     serializer_class = serializers.StageSchemeDataSerializer
-    queryset = models.StageSchemeData.objects.all()
+    queryset = models.StageSchemeData.objects.select_related('unit_stage_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
@@ -355,28 +587,34 @@ class TypeEnergyViewSet(viewsets.ModelViewSet):
 class ElectricityConsumptionDeconstructiveProcessViewSet(viewsets.ModelViewSet):
     """Handle creating and updating create ECDP"""
     serializer_class = serializers.ElectricityConsumptionDeconstructiveProcessSerializer
-    queryset = models.ElectricityConsumptionDeconstructiveProcess.objects.all()
+    queryset = models.ElectricityConsumptionDeconstructiveProcess.objects.select_related(
+        'unit_id', 'source_information_id', 'section_id', 'project_id',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
 class TreatmentOfGeneratedWasteViewSet(viewsets.ModelViewSet):
     """Handle creating and updating create TOGW"""
     serializer_class = serializers.TreatmentOfGeneratedWasteSerializer
-    queryset = models.TreatmentOfGeneratedWaste.objects.all()
+    queryset = models.TreatmentOfGeneratedWaste.objects.select_related('section_id', 'project_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
 class SourceInformationDataViewSet(viewsets.ModelViewSet):
     """Handle creating and updating Source information data"""
     serializer_class = serializers.SourceInformationDataSerializer
-    queryset = models.SourceInformationData.objects.all()
+    queryset = models.SourceInformationData.objects.select_related(
+        'sourceInformarion_id', 'potential_type_id', 'unit_id',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('value', )
 
 class TypeEnergyDataViewSet(viewsets.ModelViewSet):
     """Handle creating and updating Type Energy Data"""
     serializer_class = serializers.TypeEnergyDataSerializer
-    queryset = models.TypeEnergyData.objects.all()
+    queryset = models.TypeEnergyData.objects.select_related(
+        'type_energy_id', 'potential_type_id', 'unit_id',
+    )
     filter_backends = (filters.SearchFilter,)
     search_fields = ('value', )
 
@@ -390,28 +628,28 @@ class StatesViewSet(viewsets.ModelViewSet):
 class CitiesViewSet(viewsets.ModelViewSet):
     """Handle creating and updating cities"""
     serializer_class = serializers.CitiesSerializer
-    queryset = models.City.objects.all()
+    queryset = models.City.objects.select_related('state_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
 class LocalDistancesViewSet(viewsets.ModelViewSet):
     """Handle creating and updating local distances"""
     serializer_class = serializers.LocalDistancesSerializer
-    queryset = models.LocalDistance.objects.all()
+    queryset = models.LocalDistance.objects.select_related('city_id_origin', 'city_id_end')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
 class PotentialTransportViewSet(viewsets.ModelViewSet):
     """Handle creating and updating potential transports"""
     serializer_class = serializers.PotentialTransportSerializer
-    queryset = models.PotentialTransport.objects.all()
+    queryset = models.PotentialTransport.objects.select_related('transport_id', 'potential_type_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
 class ConversionsViewSet(viewsets.ModelViewSet):
     """Handle creating and updating conversions"""
     serializer_class = serializers.ConversionsSerializer
-    queryset = models.Conversions.objects.all()
+    queryset = models.Conversions.objects.select_related('material_id', 'unit_id')
     filter_backends = (filters.SearchFilter,)
     search_fields = ('=id', )
 
